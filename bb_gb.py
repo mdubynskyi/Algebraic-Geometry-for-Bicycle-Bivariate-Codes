@@ -109,10 +109,6 @@ class BBCode:
         return (H @ (error.astype(np.uint8) % 2)) % 2
 
 
-# ----------------------------------------------------------------------
-# 2. GF(2) linear algebra: particular solution + kernel basis
-# ----------------------------------------------------------------------
-
 def gf2_rref_augmented(H: np.ndarray, s: np.ndarray):
     """Row-reduce [H | s] over GF(2). Returns (R, s_r, pivot_cols)."""
     R = H.copy().astype(np.uint8) % 2
@@ -182,8 +178,7 @@ def min_weight_over_coset(e0: np.ndarray, kernel_basis: List[np.ndarray],
     Find (or approximate) the minimum-weight vector in {e0 + sum c_i k_i}.
     Exact brute force if the kernel dimension is small; otherwise a greedy
     local-search heuristic (flip whichever kernel vector reduces weight
-    most, repeat). For real BB codes you generally want BP+OSD instead --
-    see the note in demo_realistic_size().
+    most, repeat). 
     """
     dim = len(kernel_basis)
     if dim == 0:
@@ -226,22 +221,10 @@ def gf2_decode(H: np.ndarray, s: np.ndarray, minimize_weight: bool = True):
     return e0
 
 
-# ----------------------------------------------------------------------
-# 3. The Groebner-basis decoder (your original approach, made explicit
-#    about the free-variable structure it actually produces)
-# ----------------------------------------------------------------------
+
 
 def groebner_decode(H: np.ndarray, s: np.ndarray, minimize_weight: bool = True,
                      verbose: bool = False):
-    """
-    Builds I = <e_i^2 - e_i, syndrome rows> and computes a lex Groebner
-    basis over GF(2). Returns the same kind of (solution, free_vars) info
-    as gf2_decode, but derived via Buchberger's algorithm, so you can see
-    the two agree. Only practical for small H (say n <= ~40) -- generic
-    Groebner-basis software does not exploit the fact that these
-    particular equations are linear, so it scales far worse than the
-    Gaussian-elimination version above for the same problem.
-    """
     m_rows, n = H.shape
     e = symbols(f"e0:{n}")
     field_eqs = [ei**2 - ei for ei in e]
@@ -336,32 +319,6 @@ def groebner_decode(H: np.ndarray, s: np.ndarray, minimize_weight: bool = True,
     return sol, e0, kernel_basis, free_idx
 
 
-# ----------------------------------------------------------------------
-# 4. Bounded-distance Groebner decoding: makes Buchberger's algorithm
-#    itself return a genuinely triangular (zero-free-variable) basis,
-#    over GF(q) for any prime q -- not just GF(2).
-#
-#    This is the missing ingredient from the original algorithm sketch:
-#    the raw ideal in section 3 is underdetermined because ker(H) is
-#    nontrivial. Here we additionally constrain the ideal to "weight of e
-#    is at most t", which collapses the variety to a single point whenever
-#    t is within the code's unique-decoding radius. This is the technique
-#    the literature calls "Cooper's philosophy" / bounded-distance
-#    decoding with Groebner bases (Cooper; Fitzgerald-Lax 1998; Bulygin &
-#    Pellikaan 2009) -- the same family of methods implemented in
-#    Singular's decodegb.lib.
-#
-#    THE TRICK: for e_i ranging over GF(q), e_i^(q-1) is exactly the
-#    indicator "1 if e_i != 0 else 0" (Fermat: e_i^q = e_i for all
-#    e_i in GF(q), so e_i^(q-1) = 1 when e_i != 0 and = 0 when e_i = 0).
-#    So weight(e) <= t  <=>  every elementary symmetric polynomial
-#    E_k(e_1^(q-1), ..., e_n^(q-1)) vanishes for k = t+1, ..., n
-#    (if weight(e) = w, E_k is a sum over k-subsets that are all nonzero;
-#    there are none once k > w). Adding these as ideal generators, on top
-#    of the field equations and syndrome equations, is what makes the
-#    reduced Groebner basis triangular.
-# ----------------------------------------------------------------------
-
 from sympy.polys.polyfuncs import symmetric_poly
 
 
@@ -376,12 +333,6 @@ def _format_linear(coeffs: dict, q: int) -> str:
 
 @dataclass
 class DecodeReport:
-    """
-    Everything about one bounded_distance_decode() call, in a form that can
-    be printed as a full worked derivation (report.pretty(), or just
-    print(report)) or consumed programmatically (report.status,
-    report.solution, ...).
-    """
     status: str                              # 'unique' | 'no_solution' | 'underdetermined'
     n: int
     q: int
@@ -426,19 +377,6 @@ class DecodeReport:
 
 def bounded_distance_decode(H: np.ndarray, s: np.ndarray, t: int, q: int = 2,
                              max_enumerate: int = 64) -> DecodeReport:
-    """
-    Decode syndrome s for check matrix H (entries in GF(q)) assuming
-    weight(e) <= t, via a single Groebner basis computation. Returns a
-    DecodeReport carrying the actual equations, the actual reduced
-    Groebner basis, and the read-off answer (or, if the basis isn't
-    triangular, every alternative consistent with the constraints, up to
-    max_enumerate) -- print(report) shows the full worked derivation.
-
-    Only practical for small n (the weight constraints have up to C(n,t)
-    terms) -- this is an exact small-scale / verification tool, matching
-    the scope of "basic correctness" testing, not a production decoder
-    for full-size BB codes.
-    """
     m_rows, n = H.shape
     e = symbols(f"e0:{n}")
 
@@ -538,3 +476,146 @@ def classical_min_distance(H: np.ndarray, q: int = 2, brute_force_max_n: int = 1
             if best is None or w < best:
                 best = w
     return best
+
+def _columns_as_ints(H: np.ndarray) -> List[int]:
+    """Pack each column of H (GF(2)) into a Python int for fast XOR/hashing."""
+    m_rows, n = H.shape
+    cols = [0] * n
+    for i in range(m_rows):
+        bit = 1 << i
+        for j in np.nonzero(H[i, :])[0]:
+            cols[j] |= bit
+    return cols
+
+
+def find_low_weight_codeword(H: np.ndarray, max_t: int = 4):
+    """
+    Meet-in-the-middle search for the minimum-weight nonzero vector in
+    ker(H) over GF(2), up to weight max_t (supports max_t in {1,2,3,4}).
+    Returns (t, [column indices]) for the lowest t <= max_t that has a
+    witness, or (None, None) if nothing of weight <= max_t exists (a
+    genuine lower bound: d > max_t).
+    """
+    cols = _columns_as_ints(H)
+    n = len(cols)
+
+    for i, c in enumerate(cols):
+        if c == 0:
+            return 1, [i]
+    if max_t < 2:
+        return None, None
+
+    seen = {}
+    for i, c in enumerate(cols):
+        if c in seen:
+            return 2, [seen[c], i]
+        seen[c] = i
+    if max_t < 3:
+        return None, None
+
+    pair_xor = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            pair_xor.setdefault(cols[i] ^ cols[j], []).append((i, j))
+
+    for k, c in enumerate(cols):
+        if c in pair_xor:
+            for (i, j) in pair_xor[c]:
+                if k != i and k != j:
+                    return 3, [i, j, k]
+    if max_t < 4:
+        return None, None
+
+    for x, pairs in pair_xor.items():
+        if len(pairs) < 2:
+            continue
+        for a in range(len(pairs)):
+            for b in range(a + 1, len(pairs)):
+                i, j = pairs[a]
+                k, l = pairs[b]
+                if len({i, j, k, l}) == 4:
+                    return 4, [i, j, k, l]
+    return None, None
+
+
+
+def find_low_weight_solution(H: np.ndarray, s: np.ndarray, max_t: int = 4):
+    """
+    Find e with H @ e = s (mod 2) and weight(e) <= max_t, by meet-in-the-
+    middle over column subsets (supports max_t up to 5). Returns
+    (t, [column indices]) for the lowest such t, or (None, None) if no
+    solution of weight <= max_t exists for this syndrome.
+
+    t=5 uses a 2+2+1 split against the same pairwise-XOR table used for
+    t=3/4, so it's slower (an extra loop over hash keys per single column)
+    but was still ~20ms/trial on a real n=144 code in testing -- not
+    profiled beyond that; treat t=5 as "worked when tested", not
+    "guaranteed fast for every H".
+    """
+    cols = _columns_as_ints(H)
+    n = len(cols)
+    target = 0
+    for i in range(H.shape[0]):
+        if s[i]:
+            target |= (1 << i)
+
+    if target == 0:
+        for i, c in enumerate(cols):
+            if c == 0:
+                return 0, []
+    for i, c in enumerate(cols):
+        if c == target:
+            return 1, [i]
+    if max_t < 2:
+        return None, None
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if cols[i] ^ cols[j] == target:
+                return 2, [i, j]
+    if max_t < 3:
+        return None, None
+
+    pair_xor = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            pair_xor.setdefault(cols[i] ^ cols[j], []).append((i, j))
+
+    for k, c in enumerate(cols):
+        need = c ^ target
+        if need in pair_xor:
+            for (i, j) in pair_xor[need]:
+                if k != i and k != j:
+                    return 3, [i, j, k]
+    if max_t < 4:
+        return None, None
+
+    checked = set()
+    for x, pairs in pair_xor.items():
+        y = x ^ target
+        key = frozenset((x, y))
+        if key in checked:
+            continue
+        checked.add(key)
+        if y not in pair_xor:
+            continue
+        for (i, j) in pairs:
+            for (k, l) in pair_xor[y]:
+                if len({i, j, k, l}) == 4:
+                    return 4, [i, j, k, l]
+    if max_t < 5:
+        return None, None
+
+    keys = list(pair_xor.keys())
+    for e, ce in enumerate(cols):
+        need = target ^ ce
+        for x1 in keys:
+            x2 = x1 ^ need
+            if x2 in pair_xor:
+                for (a, b) in pair_xor[x1]:
+                    if e in (a, b):
+                        continue
+                    for (c, d) in pair_xor[x2]:
+                        if len({a, b, c, d, e}) == 5:
+                            return 5, [a, b, c, d, e]
+    return None, None
